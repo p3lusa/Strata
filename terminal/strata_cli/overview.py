@@ -164,6 +164,15 @@ def build(metrics: dict | None) -> dict | None:
                 "vram_hist": _series(history, "gpu_mem_used", GIB), "temp": _num(hw.get("gpu_temp")), "temp_hist": _series(history, "gpu_temp"),
                 "power": _num(hw.get("gpu_power")), "power_limit": _num(hw.get("gpu_power_limit")), "power_hist": _series(history, "gpu_power"),
                 "pcie_rx": _num(hw.get("gpu_pcie_rx_mb")), "pcie_hist": _series(history, "gpu_pcie_rx_mb"),
+                # AMD consumer cards expose no PCIe byte counters (amdsmi: NOT_SUPPORTED on gfx1201); the engine's
+                # measured share of routed experts fetched over PCIe is the live signal this card can give
+                "pcie_share": _num(last.get("pcie_share")) if last else None,
+                "pcie_mb_s": _num(last.get("pcie_mb_s")) if last else None,
+                "pcie_mb_series": _series(history, "pcie_mb_s"),
+                "pcie_mb_hist": list(reversed([_num(r.get("pcie_mb_s")) for r in (recent if isinstance(recent, list) else [])
+                                               if isinstance(r, dict) and _num(r.get("pcie_mb_s")) is not None])),
+                "pcie_share_hist": list(reversed([_num(r.get("pcie_share")) for r in (recent if isinstance(recent, list) else [])
+                                                  if isinstance(r, dict) and _num(r.get("pcie_share")) is not None])),
                 "pcie_gen": gen if gen is not None else genmax, "pcie_gen_max": genmax, "pcie_width": width, "pcie_width_max": width_cap,
                 "count": _num(static.get("gpu_count"))},
         "cpu": {"load": _num(hw.get("cpu_pct") if hw.get("cpu_pct") is not None else hw.get("cpu")), "hist": _series(history, "cpu"),
@@ -473,8 +482,11 @@ def render(model: dict, *, width: int, height: int, connection: str, connection_
         (_tile("PCIe", "not used", ("memory is shared", "memory shared"), spark([], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style)
          if unified else
          _tile("PCIe", link, link_note if link_note else (f"slowest of {ncards} cards", "slowest card") if ncards else
-               ((f"to GPU {fmt(g['pcie_rx'])} MB/s", f"{fmt(g['pcie_rx'])} MB/s") if g["pcie_rx"] is not None else "to GPU --"),
-               spark(g["pcie_hist"], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style)),
+               ((f"to GPU {fmt(g['pcie_rx'])} MB/s", f"{fmt(g['pcie_rx'])} MB/s") if g["pcie_rx"] is not None else
+                (f"\u2248{fmt(g['pcie_mb_s'] / 1000, 1)} GB/s experts", f"\u2248{fmt(g['pcie_mb_s'] / 1000, 1)} GB/s") if (g.get("pcie_mb_s") or 0) >= 1000 else
+                (f"\u2248{fmt(g['pcie_mb_s'], 0)} MB/s experts", f"\u2248{fmt(g['pcie_mb_s'], 0)} MB/s") if g.get("pcie_mb_s") is not None else
+                (f"{int(round(g['pcie_share'] * 100))}% experts via PCIe", f"share {int(round(g['pcie_share'] * 100))}%") if g.get("pcie_share") is not None else "to GPU --"),
+               spark([v for v in g["pcie_hist"] if v is not None] or [v for v in g.get("pcie_mb_series") or [] if v is not None] or g.get("pcie_mb_hist") or g.get("pcie_share_hist") or [], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style)),
         _tile("CPU", f"{fmt(c['load'])} %", cpu_sub, spark(c["hist"], inner, glyphs, lo=0, hi=100), tile_w, accent=accent, box_style=box_style),
         _tile("Disk read", f"{fmt(d['read'], 1)} MB/s", f"write {fmt(d['write'], 1)} MB/s" if d["write"] is not None else "write --",
               spark(d["hist"], inner, glyphs, lo=0), tile_w, accent=accent, box_style=box_style),

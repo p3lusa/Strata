@@ -5179,7 +5179,8 @@ class Service:
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
-                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean()},
+                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean(),
+                                                    "pcie_mb_s": self._pcie_mb_s()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
                                        amd=getattr(self, "backend", None) == "hip")
@@ -5222,6 +5223,25 @@ class Service:
             many = [dict(st) for st, _ in self.live_reqs.values()] or [dict(self.status)]
         return sum(s["generated"] / max(1e-6, time.time() - s["first_token"]) for s in many
                    if s.get("busy") and s.get("first_token"))
+
+    def _pcie_mb_s(self):
+        """Derived PCIe bandwidth for cards without traffic counters (consumer AMD): the engine's cumulative
+        offloaded-expert count times the expert cache's bytes per slot, over the sample interval. 0.0 means
+        the link was idle since the last sample; None means this engine/card cannot report it at all."""
+        total = getattr(self, "pcie_experts_total", None)
+        ei = getattr(self.engine, "info", {}) or {}
+        e_slots = ei.get("expert_slots_primary") or ei.get("expert_slots")
+        e_mib = ei.get("expert_cache_primary_mib") or ei.get("expert_cache_mib")
+        if not e_slots or not e_mib:
+            return None
+        t = time.time()
+        if total is None:
+            self._pcie_prev = (t, 0)   # baseline keeps counting: the first request's bytes must show as a spike
+            return None
+        prev, self._pcie_prev = getattr(self, "_pcie_prev", (t, 0)), (t, total)
+        if prev is None or t <= prev[0]:
+            return None
+        return round((total - prev[1]) * e_mib * 1048576 / e_slots / (t - prev[0]) / 1e6, 1)
 
     def _prefill_tok_s_mean(self):
         """Engine-reported mean over newly read tokens, excluding the cached prefix."""
@@ -6441,6 +6461,20 @@ class Service:
                             routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
+                            # consumer AMD drivers expose no PCIe byte counters (amdsmi: NOT_SUPPORTED on RDNA);
+                            # the engine's measured offloaded-expert count, times the expert cache's bytes per
+                            # slot, over the request's busy time, is the bandwidth such a card can report
+                            ei = getattr(self.engine, "info", {}) or {}
+                            e_slots = ei.get("expert_slots_primary") or ei.get("expert_slots")
+                            e_mib = ei.get("expert_cache_primary_mib") or ei.get("expert_cache_mib")
+                            busy_ms = (last.get("prompt_ms") or 0) + (last.get("decode_ms") or 0)
+                            try:
+                                pcie_mb_s = round(last["offloaded"] * e_mib * 1048576 / e_slots / busy_ms * 1000 / 1e6, 1) \
+                                    if last.get("offloaded") is not None and busy_ms else None
+                            except (TypeError, ZeroDivisionError):
+                                pcie_mb_s = None
+                            if last.get("offloaded"):
+                                self.pcie_experts_total = getattr(self, "pcie_experts_total", 0) + last["offloaded"]
                             seen = 0 if admission_rejected else prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read; #3040
                             if inkling_images and not admission_rejected and finish != "cancel":
                                 # Inkling's pictures are ONE placeholder id each in `ids`; the engine expands them to the picture's tokens and its DONE line
@@ -6462,7 +6496,7 @@ class Service:
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and (last.get("generated") or 0) >= 2 and last.get("decode_ms") else None,
-                                "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
+                                "hit_rate": hit_rate, "pcie_share": pcie_share, "pcie_mb_s": pcie_mb_s, "ram_blobs": last.get("ram_blobs"),
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),

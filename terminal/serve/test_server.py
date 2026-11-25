@@ -2743,6 +2743,7 @@ class PcieShare(unittest.TestCase):
             "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20 25",     # 25 more over PCIe: 20% of 125 routed
             "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20 0",
             "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20"])       # an older engine
+        engine.info = {"expert_slots": 100, "expert_cache_mib": 200}   # 2 MiB per expert slot
         svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         with contextlib.redirect_stdout(io.StringIO()) as out:
             for _ in range(3):
@@ -2750,7 +2751,25 @@ class PcieShare(unittest.TestCase):
         rows = list(svc.history)
         self.assertEqual([r["hit_rate"] for r in rows], [0.6, 0.6, 0.6])
         self.assertEqual([r["pcie_share"] for r in rows], [0.2, 0.0, None])
+        # 25 experts x 2 MiB over 70 ms busy = 749 MB/s; 0 offloaded is 0.0; an engine without field 15 reports None
+        self.assertEqual([r["pcie_mb_s"] for r in rows], [749.0, 0.0, None])
         self.assertIn("expert cache 60.0% hit (+20.0% of the routed experts over PCIe)", out.getvalue())
+
+    def test_the_sampler_turns_the_cumulative_counter_into_a_per_second_series(self):
+        """The PCIe sparkline must move every second, not only when a request finishes: the sampler reads the
+        cumulative offloaded-expert counter and reports the bytes moved since its previous tick."""
+        tok = ByteTokenizer()
+        engine = DoneLineEngine(tok, "</think>\n\nok", max_context=CTX, done_lines=[
+            "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20 25"])
+        engine.info = {"expert_slots": 100, "expert_cache_mib": 200}
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertIsNone(svc._pcie_mb_s())                            # no request yet: the tile shows nothing
+        with contextlib.redirect_stdout(io.StringIO()):
+            list(svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event()))
+        self.assertEqual(svc.pcie_experts_total, 25)
+        svc._pcie_prev = (time.time() - 1.0, 0)                        # pretend the sampler ticked before the request
+        self.assertAlmostEqual(svc._pcie_mb_s(), 25 * 2 * 1048576 / 1e6, delta=6)   # ~52.4 MB/s over ~1 s
+        self.assertEqual(svc._pcie_mb_s(), 0.0)                        # nothing moved since the previous tick
 
 
 class PromptCacheSpread(unittest.TestCase):

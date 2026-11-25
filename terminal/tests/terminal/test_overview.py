@@ -158,6 +158,27 @@ class Draw(unittest.TestCase):
         self.assertIn("1-6 views", text)
         self.assertNotIn("7 Connect", text)
 
+    def test_the_pcie_tile_shows_derived_bandwidth_when_the_gpu_has_no_counters(self):
+        """A consumer AMD card reports no PCIe byte counters; the engine's own expert-offload counts give the
+        bandwidth instead, and the sampler's per-second series keeps the sparkline moving while the link idles."""
+        m = metrics()
+        m["hardware"]["gpu_pcie_rx_mb"] = None
+        m["history"].pop("gpu_pcie_rx_mb")
+        m["history"]["pcie_mb_s"] = [0.0] * 30 + [4700.0] * 10 + [0.0] * 20
+        m["requests"][0]["pcie_mb_s"] = 4700.0
+        text = draw(overview.build(m))
+        self.assertIn("Gen4 x16", text)
+        self.assertIn("≈4.7 GB/s experts", text)
+        self.assertNotIn("to GPU", text)
+
+    def test_the_pcie_tile_falls_back_to_the_offload_share_for_older_engines(self):
+        """An engine that reports the PCIe offload share but not the expert sizes still gets a live tile."""
+        m = metrics()
+        m["hardware"]["gpu_pcie_rx_mb"] = None
+        m["history"].pop("gpu_pcie_rx_mb")
+        m["requests"][0]["pcie_share"] = 0.2
+        self.assertIn("20% experts via PCIe", draw(overview.build(m)))
+
     def test_ascii_mode_has_no_glyphs_the_classic_windows_console_font_lacks(self):
         text = draw(overview.build(metrics()), glyphs="ascii", color=False)
         for bad in "▁▂▃▄▅▆▇█░╭╮╰╯✓●":
