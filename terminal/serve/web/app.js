@@ -585,6 +585,19 @@ function renderContext(live, eng, last, on) {
   }
   $("ctx-note").hidden = !c.queued;
 }
+// a GPU that reports no PCIe byte counters (consumer AMD: amdgpu exposes no traffic counters and
+// amdsmi_get_gpu_pci_throughput answers NOT_SUPPORTED) shows the bandwidth the engine itself measured
+// instead of an empty card: pcie_mb_s per request (offloaded experts x bytes/expert / busy time) and the
+// sampler's per-second pcie_mb_s series for the sparkline. A card that does report gpu_pcie_rx_mb
+// (Nvidia, Intel, and AMD where the driver counts) keeps the old rendering untouched.
+function pcieBandwidth(hw, h, requests) {
+  if (!hw || hw.gpu_pcie_rx_mb != null) return null;
+  const mb = Math.max(0, ...requests.map((r) => r.pcie_mb_s).filter((v) => v != null));
+  const series = ((h || {}).pcie_mb_s || []).some((v) => v != null) ? h.pcie_mb_s : null;
+  if (!mb && !series) return null;
+  return { mb: mb || null, series };
+}
+
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // model state
   // A local turn keeps metrics on "unloaded" for the whole engine start.
@@ -691,14 +704,17 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
                    : { gen: hw.gpu_pcie_gen, gen_max: hw.gpu_pcie_gen_max, width: hw.gpu_pcie_width, width_max: hw.gpu_pcie_width_max };
   const gen = one.gen_max || one.gen;
   const width = one.width ? `x${one.width}` + (one.width_max > one.width ? ` of x${one.width_max}` : "") : "";
+  const derived = pcieBandwidth(hw, h, requests);
   const rx = hw.gpu_pcie_rx_mb == null ? ""
            : `${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s`;
   setMetric("pcie", gen ? `Gen${gen}` : null, width,
             multi ? `${per(link)}${rx ? ` · ${rx} total` : ""}`
-                  : rx === "" ? (unread(gen || null) ? "not available" : "") : `to GPU ${rx}` +
-                  (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""),
+                  : rx !== "" ? `to GPU ${rx}` +
+                    (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : "")
+                  : derived && derived.mb ? `≈${derived.mb >= 1000 ? `${(derived.mb / 1000).toFixed(1)} GB/s` : `${fmt(derived.mb, 0)} MB/s`} experts`
+                  : (unread(gen || null) ? "not available" : ""),
             unread(gen || null) ? st.gpu_note : "");
-  spark("sp-pcie", h.gpu_pcie_rx_mb);
+  spark("sp-pcie", rx === "" && derived && derived.series ? derived.series : h.gpu_pcie_rx_mb);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
   if (hw.disk_read_mb == null) {
